@@ -1,0 +1,502 @@
+
+import math
+import re
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+import pandas as pd
+import pydeck as pdk
+import phonenumbers
+from phonenumbers import PhoneNumberFormat
+from cleanco import basename
+
+import config
+from models_sql import Session, Job, Profile
+from db_profiles import update_favorite_job
+from finnhub_api import Finnhub_REST_API_Client
+
+stock_client = Finnhub_REST_API_Client(url="https://finnhub.io/api", api_ver="v1")
+
+
+def process_results(job_id_list, profile_data, ui):
+
+    db_session = Session()
+    job_list = db_session.query(Job).filter(Job.job_id.in_(job_id_list)).all()
+
+    ###############
+
+    ui.markdown("### 🔍 Refine Results")
+
+    ui.text_input("Search Jobs", placeholder="Type keyword, company, skill, etc.", key="search_term")
+    search_term = ui.session_state.get("search_term", "")
+    visible_jobs = filter_jobs_by_search(job_list, search_term)
+
+    visible_jobs = update_filter_bar(visible_jobs, ui)
+
+    ###############
+
+    visible_job_ids = [job.job_id for job in visible_jobs if job.job_id]
+    ui.session_state["visible_job_ids"] = visible_job_ids
+
+    ui.success(f"Found {len(visible_jobs)} jobs")
+
+    update_job_map(visible_jobs, profile_data, ui)
+
+    show_jobs(visible_jobs, ui=ui)
+
+
+def update_filter_bar(job_list, ui):
+
+    # Helper to extract raw value from label
+    def extract_raw_value(label):
+        return label.rsplit(" (", 1)[0] if " (" in label else label
+
+    # Get current selections from session_state
+    selected_company_label = ui.session_state.get("filter_company", "All")
+    selected_location_label = ui.session_state.get("filter_location", "All")
+    selected_employment_label = ui.session_state.get("filter_employment", "All")
+
+    selected_company = extract_raw_value(selected_company_label)
+    selected_location = extract_raw_value(selected_location_label)
+    selected_employment = extract_raw_value(selected_employment_label)
+
+    # Step 1: Pre-filter job list based on current selections
+    filtered_jobs = [
+        job for job in job_list
+        if (selected_company == "All" or (job.company and job.company.name == selected_company))
+        and (selected_location == "All" or job.city == selected_location)
+        and (selected_employment == "All" or (selected_employment in job.employment_type if job.employment_type else False))
+    ]
+
+    # Step 2: Recount values in filtered list
+    company_counts = Counter(job.company.name for job in filtered_jobs if job.company)
+    location_counts = Counter(job.city for job in filtered_jobs if job.city)
+    employment_flat = [etype for job in filtered_jobs if job.employment_type for etype in job.employment_type]
+    employment_counts = Counter(employment_flat)
+
+    def format_options(counter):
+        return ["All"] + sorted([f"{k} ({v})" for k, v in counter.items()])
+
+    # Step 3: Build UI with filtered options
+    col1, col2, col3 = ui.columns(3)
+
+    with col1:
+        company_options = format_options(company_counts)
+        selected_company_label = ui.selectbox(
+            "Company", company_options,
+            index=company_options.index(selected_company_label) if selected_company_label in company_options else 0,
+            key="filter_company"
+        )
+        selected_company = extract_raw_value(selected_company_label)
+
+    with col2:
+        location_options = format_options(location_counts)
+        selected_location_label = ui.selectbox(
+            "Location", location_options,
+            index=location_options.index(selected_location_label) if selected_location_label in location_options else 0,
+            key="filter_location"
+        )
+        selected_location = extract_raw_value(selected_location_label)
+
+    with col3:
+        employment_options = format_options(employment_counts)
+        selected_employment_label = ui.selectbox(
+            "Employment Type", employment_options,
+            index=employment_options.index(selected_employment_label) if selected_employment_label in employment_options else 0,
+            key="filter_employment"
+        )
+        selected_employment = extract_raw_value(selected_employment_label)
+
+    # Step 4: Apply final filters
+    final_result_list = [
+        job for job in job_list
+        if (selected_company == "All" or (job.company and job.company.name == selected_company))
+        and (selected_location == "All" or job.city == selected_location)
+        and (selected_employment == "All" or (selected_employment in job.employment_type if job.employment_type else False))
+    ]
+
+    final_result_list.sort(key=lambda job: job.title.lower() if job.title else "")
+
+    return final_result_list
+
+
+def filter_jobs_by_search(visible_jobs, search_term):
+
+    if not search_term:
+        return visible_jobs
+
+    pattern = re.compile(rf"\b{re.escape(search_term.lower())}\b")
+
+    filtered = []
+
+    for job in visible_jobs:
+
+        fields = [
+            (job.title or "").lower(),
+            (job.description or "").lower(),
+            (job.job_summary or "").lower(),
+            (job.company.name.lower() if job.company else "")
+        ]
+
+        if any(pattern.search(field) for field in fields):
+            filtered.append(job)
+
+    return filtered
+
+
+def update_job_map(job_list, profile_data, ui):
+
+    data = [
+        {
+            "lat": job.job_latitude,
+            "lon": job.job_longitude
+        }
+        for job in job_list
+        if job.job_latitude is not None and job.job_longitude is not None
+    ]
+
+    df = pd.DataFrame(data)
+
+    if df.empty:
+        show_empty_map(ui)
+        return
+
+    # Add your current location
+    my_latitude = profile_data.get("latitude")
+    my_longitude = profile_data.get("longitude")
+
+    if my_latitude and my_longitude:
+        user_point = pd.DataFrame([{"lat": my_latitude, "lon": my_longitude}])
+        df = pd.concat([df, user_point], ignore_index=True)
+
+    if df.empty:
+        ui.info("No job locations to display.")
+        return
+
+    # Get map bounds
+    min_lat, max_lat = df["lat"].min(), df["lat"].max()
+    min_lon, max_lon = df["lon"].min(), df["lon"].max()
+
+    # Compute center
+    center_lat = (min_lat + max_lat) / 2
+    center_lon = (min_lon + max_lon) / 2
+
+    # Compute zoom level (approximate, tweak padding)
+    def compute_zoom(lat_range, lon_range, padding=1.3):
+        max_range = max(lat_range, lon_range) * padding
+        return 8 - math.log2(max_range + 1e-6)
+
+    zoom = compute_zoom(max_lat - min_lat, max_lon - min_lon, padding=1.3)
+    zoom = max(min(zoom, 20), 1)
+
+    # Red circles for jobs
+    job_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=df[df["lat"] != my_latitude],  # exclude user point
+        get_position='[lon, lat]',
+        get_fill_color='[255, 0, 0, 255]',
+        get_radius=1000,
+    )
+
+    # Green circle for your location
+    if my_latitude and my_longitude:
+        user_layer = pdk.Layer(
+            "ScatterplotLayer",
+            data=[{"lat": my_latitude, "lon": my_longitude}],
+            get_position='[lon, lat]',
+            get_fill_color='[0, 255, 0, 255]',
+            get_radius=1000,
+        )
+    else:
+        user_layer = None
+
+    # Show map
+    layers = [job_layer]
+    if user_layer:
+        layers.append(user_layer)
+
+    view_state = pdk.ViewState(
+        latitude=center_lat,
+        longitude=center_lon,
+        zoom=zoom,
+    )
+
+    ui.pydeck_chart(pdk.Deck(
+        map_style=config.map_style_location,
+        initial_view_state=view_state,
+        layers=layers
+    ))
+
+
+def show_empty_map(ui):
+
+    view_state = pdk.ViewState(
+        latitude=39.5,
+        longitude=-98.35,
+        zoom=3,
+        pitch=0
+    )
+
+    ui.pydeck_chart(pdk.Deck(
+        map_style=config.map_style_location,
+        initial_view_state=view_state,
+        layers=[]
+    ))
+
+
+def show_jobs(job_list, ui, key_prefix="main"):
+
+    for idx, job in enumerate(job_list):
+
+        job_id = job.job_id
+        job_title = job.title or "N/A"
+        company = job.company.name if job.company else "Unknown"
+
+        city = job.city or "N/A"
+        country = job.country or "N/A"
+        location = f"{city}, {country}" if city != 'N/A' else country
+
+        employment_type = ", ".join(job.employment_type or []) or "N/A"
+        salary = job.job_min_salary
+        salary_max = job.job_max_salary
+
+        if pd.notnull(salary) and pd.notnull(salary_max):
+            estimated_salary = f"{int(salary):,} - {int(salary_max):,}"
+        elif pd.notnull(salary):
+            estimated_salary = f"{int(salary):,}+"
+        else:
+            estimated_salary = "N/A"
+
+        posted_at = job.posted_at_utc
+
+        if posted_at:
+            try:
+                if posted_at.tzinfo is None:
+                    posted_at = posted_at.replace(tzinfo=timezone.utc)
+                days_ago = (datetime.now(timezone.utc) - posted_at).days
+                posted = f"{days_ago} days ago"
+            except Exception as e:
+                posted = "Unknown"
+                ui.warning(f"Could not parse posted_at: {posted_at} ({e})")
+        else:
+            posted = "Unknown"
+
+        company_key = f"{key_prefix}_btn_{job_id}"
+        show_key = f"{key_prefix}_show_company_info_{job_id}"
+        stock_key = f"{key_prefix}_stock_info_{job_id}"
+
+        cols = ui.columns([0.77, 0.13, 0.1])
+
+        with cols[0]:
+
+            label = f"💼 {idx+1}. **{job_title}** - {location} - {company} - *Posted {posted}*"
+
+            with ui.expander(label, expanded=False):
+
+                logo_url = job.company.logo_url if job.company and job.company.logo_url else None
+                if logo_url:
+                    ui.image(logo_url, width=50)
+
+                ui.markdown(f"**🏢 Company:** {company}")
+
+                if ui.button(f"🔍 Show More About the Company", key=company_key):
+                    ui.session_state[show_key] = not ui.session_state.get(show_key, False)
+
+                if ui.session_state.get(show_key, False):
+
+                    if stock_key not in ui.session_state:
+                        with ui.spinner("Fetching company details..."):
+                            ui.session_state[stock_key] = get_stock_details(company, ui)
+
+                    stock_info = ui.session_state.get(stock_key)
+
+                    if stock_info:
+
+                        ui.markdown("#### 🏢 Company Profile")
+
+                        logo_url = stock_info.get("logo", "")
+                        if logo_url:
+                            ui.image(logo_url, width=60)
+
+                        quote = stock_info.get("quote", {})
+                        peers = stock_info.get("peers", [])
+                        latest_news = stock_info.get("news", [])
+
+                        international = 'N/A'
+                        raw_number = stock_info.get('phone')
+                        if raw_number:
+                            parsed_number = phonenumbers.parse(raw_number, "US")
+                            international = phonenumbers.format_number(parsed_number, PhoneNumberFormat.INTERNATIONAL)
+
+                        ui.markdown(f"**🏢 Name:** {stock_info.get('name', 'N/A')}")
+                        ui.markdown(f"**🌍 Country:** {stock_info.get('country', 'N/A')}")
+                        ui.markdown(f"**🏭 Industry:** {stock_info.get('finnhubIndustry', 'N/A')}")
+                        ui.markdown(f"**📞 Phone:** {international}")
+                        ui.markdown(f"**🌐 Website:** {stock_info.get('weburl')}")
+                        ui.markdown(f"**🏷️ Ticker:** {stock_info.get('ticker', 'N/A')}")
+                        ui.markdown(f"**💲 Stock Price:** {quote.get('c', 'N/A')}")
+                        if peers:
+                            ui.markdown("**👥 Peers (sorted by market capitalizations):**")
+                            ui.markdown("\n".join(f"- {name}" for name in peers))
+
+                        if latest_news:
+                            ui.markdown("### 📰 Latest News")
+                            for article in latest_news:
+                                headline = article.get("headline", "No title")
+                                url = article.get("url", "#")
+                                dt = datetime.utcfromtimestamp(article["datetime"]).strftime("%Y-%m-%d %H:%M UTC")
+                                with ui.container():
+                                    ui.markdown(f"**[{headline}]({url})** at *{dt}*")
+                    else:
+                        ui.warning("This company is not publicly traded or financial data is unavailable.")
+
+                ui.markdown(f"**📍 Location:** {location}")
+                ui.markdown(f"**🧾 Employment Type:** {employment_type}")
+                ui.markdown(f"**💰 Estimated Salary:** {estimated_salary}")
+                ui.markdown(f"**🕓 Posted:** {posted}")
+                ui.markdown(f"**🔗 [Job Link]({job.apply_link or '#'})**")
+
+                job_summary = job.job_summary
+                if job_summary:
+                    ui.markdown("#### ✨ Job Highlights")
+                    ui.markdown(job_summary)
+                else:
+                    highlights = job.job_highlights
+                    if highlights:
+                        ui.markdown("#### ✨ Job Highlights")
+                        for section, bullets in highlights.items():
+                            ui.markdown(f"**{section}**")
+                            for item in bullets:
+                                single_line = item.replace("\n", " ").strip()
+                                ui.markdown(f"- {single_line}")
+
+        with cols[1]:
+
+            profile_name = ui.session_state.get("selected_profile", "")
+
+            if "favorite_jobs" not in ui.session_state:
+
+                # Sync with DB at first access
+                with Session() as db:
+                    profile = db.query(Profile).filter(Profile.name == profile_name).first()
+                    ui.session_state.favorite_jobs = set(profile.favorite_job_ids or [])
+
+            is_fav = job_id in ui.session_state.favorite_jobs
+            fav_key = f"{key_prefix}_fav_{job_id}_toggle"
+
+            fav_state = ui.toggle(
+                "Favorite",
+                value=is_fav,
+                key=fav_key)
+
+            if fav_state != is_fav:
+
+                if fav_state:
+                    ui.session_state.favorite_jobs.add(job_id)
+                    update_favorite_job(profile_name, job_id, add=True)
+                else:
+                    ui.session_state.favorite_jobs.discard(job_id)
+                    update_favorite_job(profile_name, job_id, add=False)
+
+        with cols[2]:
+
+            if ui.button("✏️", key=f"{key_prefix}_use_job_{job.id}", help="Generate resume"):
+                ui.session_state["generate_resume"] = job
+                ui.rerun()
+
+
+def get_stock_details(company_name, ui):
+
+    stock_info = {}
+
+    status, output = get_symbol_from_name(company_name)
+    if not status:
+        print(f"get_symbol_from_name: {output}")
+        return stock_info
+
+    company_symbol = output
+
+    status, output = stock_client.company_profile2(company_symbol)
+    if status:
+        stock_info.update(output)
+
+    status, output = stock_client.company_peers(company_symbol)
+    if status:
+        stock_info["peers"] = enrich_company_peers(output, ui)
+
+    status, output = stock_client.quote(company_symbol)
+    if status:
+        stock_info["quote"] = output
+
+    ###############
+
+    to_date = datetime.utcnow().date()
+    from_date = to_date - timedelta(days=30)
+
+    # Convert to string format for API
+    from_date_str = from_date.strftime("%Y-%m-%d")
+    to_date_str = to_date.strftime("%Y-%m-%d")
+
+    status, output = stock_client.company_news(
+        company_symbol,
+        from_date=from_date_str,
+        to_date=to_date_str)
+
+    if status:
+
+        # Sort news by datetime (most recent first)
+        sorted_news = sorted(output, key=lambda x: x["datetime"], reverse=True)
+
+        # Get the top 10 most recent news items
+        stock_info["news"] = sorted_news[:10]
+
+    return stock_info
+
+
+def get_symbol_from_name(company_name):
+    """
+    Try to resolve a stock symbol from the full or partial company name.
+    """
+
+    company_base_name = basename(company_name)
+
+    status, output = stock_client.symbol_lookup(company_base_name)
+    if status and output:
+        return True, output[0]["symbol"]
+
+    name_parts = company_base_name.split()
+
+    if len(name_parts) > 1:
+
+        fallback = name_parts[0]
+        status, output = stock_client.symbol_lookup(fallback)
+        if status and output:
+            return True, output[0]["symbol"]
+
+    return False, f"No symbol found for '{company_base_name}'"
+
+
+def enrich_company_peers(peer_list, ui):
+
+    peer_dict = {}
+
+    for peer_ticker in peer_list:
+
+        status, output = stock_client.company_profile2(peer_ticker)
+        if not status:
+            ui.error(f"Failed to get company profile from {peer_ticker}")
+            return []
+
+        company_name = output.get("name", None)
+        capitalization = output.get("marketCapitalization", None)
+
+        peer_dict[company_name] = capitalization
+
+    company_names_sorted = [
+        name for name, cap in sorted(
+            peer_dict.items(),
+            key=lambda item: item[1] if item[1] is not None else -1,
+            reverse=True
+        )
+    ]
+
+    return company_names_sorted

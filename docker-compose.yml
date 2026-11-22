@@ -1,0 +1,117 @@
+services:
+  postgres-with-pgvector:
+    image: pgvector/pgvector:0.8.7-pg17-bookworm
+    container_name: pg_job
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-job_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-job_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-job_db}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres-init/001_enable_pgvector.sql:/docker-entrypoint-initdb.d/001_enable_pgvector.sql:ro
+    networks:
+      - jobnet
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7.4
+    container_name: redis_job
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    networks:
+      - jobnet
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  backend:
+    build: ./src
+    container_name: job-match-api
+    hostname: job-match-api
+    restart: unless-stopped
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    networks:
+      - jobnet
+    depends_on:
+      postgres-with-pgvector:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-job_user}:${POSTGRES_PASSWORD:-job_pass}@pg_job:5432/${POSTGRES_DB:-job_db}
+      REDIS_HOST: redis_job
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      RAPID_API_KEY: ${RAPID_API_KEY:-}
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
+      ABSTRACT_ENRICH_API_KEY: ${ABSTRACT_ENRICH_API_KEY:-}
+      COMPANY_ENRICH_API_KEY: ${COMPANY_ENRICH_API_KEY:-}
+      API_TOKEN: ${API_TOKEN:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  worker:
+    build: ./src
+    container_name: job-match-alert-worker
+    hostname: job-match-alert-worker
+    restart: unless-stopped
+    command: ["python", "alert_worker.py"]
+    networks:
+      - jobnet
+    depends_on:
+      postgres-with-pgvector:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-job_user}:${POSTGRES_PASSWORD:-job_pass}@pg_job:5432/${POSTGRES_DB:-job_db}
+      REDIS_HOST: redis_job
+      ALERT_WORKER_POLL_SECONDS: ${ALERT_WORKER_POLL_SECONDS:-30}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      RAPID_API_KEY: ${RAPID_API_KEY:-}
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
+      ABSTRACT_ENRICH_API_KEY: ${ABSTRACT_ENRICH_API_KEY:-}
+      COMPANY_ENRICH_API_KEY: ${COMPANY_ENRICH_API_KEY:-}
+      API_TOKEN: ${API_TOKEN:-}
+
+  frontend:
+    build: ./frontend
+    container_name: job-match-web
+    hostname: job-match-web
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    networks:
+      - jobnet
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000/api/v1}
+
+networks:
+  jobnet:
+    driver: bridge
+
+volumes:
+  pgdata:
